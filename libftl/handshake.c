@@ -63,6 +63,19 @@ ftl_status_t _ingest_connect(ftl_stream_configuration_private_t* ftl) {
       break;
     }
 
+    uint32_t cert_validation_flags = QUIC_CERTIFICATE_FLAG_DISABLE_CERT_VALIDATION;
+    status = msquic->SetParam(
+        ftl->ingest_connection,
+        QUIC_PARAM_LEVEL_CONNECTION,
+        QUIC_PARAM_CONN_CERT_VALIDATION_FLAGS,
+        sizeof(cert_validation_flags),
+        &cert_validation_flags);
+    if (QUIC_FAILED(status)) {
+        FTL_LOG(ftl, FTL_LOG_ERROR, "failed to set param CERT_VALIDATION_FLAGS.  error: 0x%x", status);
+        retval = FTL_CONNECT_ERROR; // TODO - Map errors?
+        break;
+    }
+
     uint16_t peer_bidi_stream_count = 1;
     status = msquic->SetParam(
       ftl->ingest_connection,
@@ -82,6 +95,9 @@ ftl_status_t _ingest_connect(ftl_stream_configuration_private_t* ftl) {
       retval = FTL_CONNECT_ERROR; // TODO - Map errors?
       break;
     }
+
+    return FTL_SUCCESS;
+
   } while (0);
 
   if (ftl->ingest_connection) {
@@ -327,7 +343,7 @@ ftl_status_t _log_response(ftl_stream_configuration_private_t *ftl, int response
     case FTL_INGEST_RESP_UNKNOWN:
         FTL_LOG(ftl, FTL_LOG_ERROR, "Ingest unknown response.");
         return FTL_INTERNAL_ERROR;
-  }    
+  }
 
   return FTL_UNKNOWN_ERROR_CODE;
 }
@@ -343,11 +359,17 @@ quic_connection_callback(
     ftl_stream_configuration_private_t *ftl = (ftl_stream_configuration_private_t *)context;
     switch (event->Type) {
     case QUIC_CONNECTION_EVENT_CONNECTED:
+      printf("QUIC_CONNECTION_EVENT_CONNECTED\n");
+      break;
+    case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
+      printf("QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT\n");
       break;
     case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
+      printf("QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER\n");
       _log_response(ftl, (int)event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode);
       break;
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
+      printf("QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE\n");
       break;
     case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
       if (event->PEER_STREAM_STARTED.Flags & QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL)

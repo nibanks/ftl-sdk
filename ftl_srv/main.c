@@ -359,7 +359,7 @@ int main(int argc, char **argv)
         argc--; argv++;
     }
 
-    if (cert_thumbprint == NULL || (cert_file == NULL && key_file == NULL)) {
+    if (cert_thumbprint == NULL && (cert_file == NULL || key_file == NULL)) {
         usage();
     }
 

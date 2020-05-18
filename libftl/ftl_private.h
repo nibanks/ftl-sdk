@@ -50,6 +50,7 @@
 #include "socket.h"
 
 #include <msquic.h>
+#include <msquicp.h>
 
 extern const QUIC_API_TABLE* msquic;
 extern HQUIC quic_registration;
