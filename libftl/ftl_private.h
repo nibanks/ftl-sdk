@@ -49,6 +49,10 @@
 #include "threads.h"
 #include "socket.h"
 
+#include <msquic.h>
+
+extern const QUIC_API_TABLE* msquic;
+extern HQUIC quic_registration;
 
 #define MAX_INGEST_COMMAND_LEN 512
 #define INGEST_PORT 8084
@@ -91,7 +95,7 @@
  // Duration at which we capture stream stats , i.e frames sent and nacks received
 #define STREAM_STATS_CAPTURE_MS 1000
 
- // Duration over which we evaluate whether we need to downgrade/upgrade bitrate. Note that we 
+ // Duration over which we evaluate whether we need to downgrade/upgrade bitrate. Note that we
  // look at stats over the last c_ulBwCheckDurationMs milliseconds, every c_ulStreamStatsCaptureMs milliseconds.
 #define BW_CHECK_DURATION_MS 5000
 
@@ -188,16 +192,19 @@ typedef struct {
  * private and not to be directly manipulated
  */
 typedef struct {
-  uint8_t packet[MAX_PACKET_BUFFER];
-  int len;
+  BOOLEAN isSendPending : 1;
+  BOOLEAN isPartOfIframe : 1;
+  BOOLEAN first : 1; /*first packet in frame*/
+  BOOLEAN last : 1; /*last packet in frame*/
+  uint32_t sn : 31;
+  uint32_t isVideoSrc : 1;
+  OS_MUTEX mutex;
   struct timeval insert_time;
   struct timeval xmit_time;
-  int sn;
-  int first;/*first packet in frame*/
-  int last; /*last packet in frame*/
-  OS_MUTEX mutex;
-  BOOL isPartOfIframe;
-}nack_slot_t;
+  QUIC_BUFFER quic_buf;
+  uint8_t packet[MAX_PACKET_BUFFER];
+}nack_slot_t; // TODO - rename to send_slot_t
+
 
 typedef struct _ping_pkt_t {
   uint32_t header;
@@ -290,15 +297,9 @@ typedef struct {
 } ftl_video_component_t;
 
 typedef struct {
-  size_t ingest_addrlen;
-  struct sockaddr *ingest_addr;
-  SOCKET media_socket;
   OS_MUTEX mutex;
-  int assigned_port;
-  OS_THREAD_HANDLE recv_thread;
   OS_THREAD_HANDLE video_send_thread;
   OS_THREAD_HANDLE audio_send_thread;
-  OS_THREAD_HANDLE ping_thread;
   OS_SEMAPHORE ping_thread_shutdown;
   int max_mtu;
   struct timeval stats_tv;
@@ -323,25 +324,24 @@ typedef struct
 } ftl_adaptive_bitrate_thread_params_t;
 
 typedef struct {
-  SOCKET ingest_socket;
+  HQUIC ingest_session;
+  HQUIC ingest_connection;
+  HQUIC ingest_auth_stream;
+  HQUIC ingest_config_stream;
   ftl_state_t state;
   OS_MUTEX state_mutex;
   OS_MUTEX disconnect_mutex;
   char *param_ingest_hostname;
   char *ingest_hostname;
-  char *ingest_ip;
-  short socket_family;
   uint32_t channel_id;
   char *key;
+  char challengeBuffer[1024];
+  uint16_t challengeBufferLength;
   char hmacBuffer[512];
   int video_kbps;
   char vendor_name[50];
   char vendor_version[50];
-  OS_THREAD_HANDLE connection_thread;
-  OS_THREAD_HANDLE keepalive_thread;
   OS_THREAD_HANDLE bitrate_monitor_thread;
-  OS_SEMAPHORE connection_thread_shutdown;
-  OS_SEMAPHORE keepalive_thread_shutdown;
   OS_SEMAPHORE bitrate_thread_shutdown;
   ftl_media_config_t media;
   ftl_audio_component_t audio;
@@ -404,7 +404,6 @@ const char * ftl_video_codec_to_string(ftl_video_codec_t codec);
 
 int recv_all(SOCKET sock, char * buf, int buflen, const char line_terminator);
 
-int ftl_get_hmac(SOCKET sock, char * auth_key, char * dst);
 int ftl_read_response_code(const char * response_str);
 int ftl_read_media_port(const char *response_str);
 
@@ -425,8 +424,7 @@ ftl_status_t enqueue_status_msg(ftl_stream_configuration_private_t *ftl, ftl_sta
 ftl_status_t _set_ingest_hostname(ftl_stream_configuration_private_t *ftl);
 int _get_remote_ip(struct sockaddr *addr, size_t addrlen, char *remote_ip, size_t ip_len);
 
-ftl_status_t _init_control_connection(ftl_stream_configuration_private_t *ftl);
-ftl_status_t _ingest_connect(ftl_stream_configuration_private_t *stream_config);
+ftl_status_t _ingest_connect(ftl_stream_configuration_private_t* ftl);
 ftl_status_t _ingest_disconnect(ftl_stream_configuration_private_t *stream_config);
 char * ingest_find_best(ftl_stream_configuration_private_t *ftl);
 void ingest_release(ftl_stream_configuration_private_t *ftl);
@@ -439,6 +437,8 @@ ftl_status_t media_speed_test(ftl_stream_configuration_private_t *ftl, int speed
 ftl_status_t internal_ingest_disconnect(ftl_stream_configuration_private_t *ftl);
 ftl_status_t internal_ftl_ingest_destroy(ftl_stream_configuration_private_t *ftl);
 void sleep_ms(int ms);
+
+void media_datagram_send_state_changed(ftl_stream_configuration_private_t* ftl, QUIC_DATAGRAM_SEND_STATE state, void** context);
 
 #if defined(_MSC_VER) && _MSC_VER < 1900
 #define snprintf _snprintf

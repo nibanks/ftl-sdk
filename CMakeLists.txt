@@ -8,6 +8,9 @@ MESSAGE(STATUS "FTL DISABLE_AUTO_INGEST: " ${DISABLE_AUTO_INGEST})
 option(DISABLE_FTL_APP "Set to TRUE to disable including the ftl app in the cmake output." FALSE)
 MESSAGE(STATUS "FTL DISABLE_FTL_APP: " ${DISABLE_FTL_APP})
 
+option(DISABLE_FTL_SRV "Set to TRUE to disable including the ftl server in the cmake output." FALSE)
+MESSAGE(STATUS "FTL DISABLE_FTL_SRV: " ${DISABLE_FTL_SRV})
+
 option(FTL_STATIC_COMPILE "Set to TRUE if you want ftl to be compiled as a static lib. If TRUE, the program will want to statically link to the ftl cmake object." FALSE)
 MESSAGE(STATUS "FTL FTL_STATIC_COMPILE: " ${FTL_STATIC_COMPILE})
 
@@ -49,6 +52,13 @@ if (NOT DISABLE_AUTO_INGEST)
   include_directories(${CMAKE_CURRENT_BINARY_DIR}/libjansson/include)
   SET(JANSSON_LIBRARIES jansson)
 endif()
+
+# We use MsQuic for QUIC protocol functionality.
+SET(QUIC_BUILD_TOOLS OFF CACHE BOOL "Disable MsQuic Tools Build")
+SET(QUIC_BUILD_TEST OFF CACHE BOOL "Disable MsQuic Tests Build")
+add_subdirectory(msquic)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/msquic/src/inc)
+SET(MSQUIC_LIBRARIES msquic)
 
 if (WIN32)
   set(FTL_PLATFORM_FILES  ftl_app/win32/xgetopt.c
@@ -98,7 +108,7 @@ include_directories(libftl libftl/gettimeofday)
 set_target_properties(ftl PROPERTIES VERSION "0.5.0")
 set_target_properties(ftl PROPERTIES SOVERSION 0)
 
-target_link_libraries(ftl ${CURL_LIBRARIES} ${JANSSON_LIBRARIES})
+target_link_libraries(ftl ${CURL_LIBRARIES} ${JANSSON_LIBRARIES} ${MSQUIC_LIBRARIES})
 
 if(WIN32)
   target_link_libraries(ftl ws2_32)
@@ -125,8 +135,13 @@ if (NOT DISABLE_FTL_APP)
                 ftl_app/dec_obj.h
                 ${FTL_PLATFORM_FILES})
 
-  target_link_libraries(ftl_app ftl ${CURL_LIBRARIES} ${JANSSON_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} ${FTL_PLATFORM_LIBS})
+  target_link_libraries(ftl_app ftl ${CURL_LIBRARIES} ${JANSSON_LIBRARIES} ${MSQUIC_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} ${FTL_PLATFORM_LIBS})
   target_include_directories(ftl_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ftl_app)
+endif()
+
+if (NOT DISABLE_FTL_SRV)
+  add_executable(ftl_srv ftl_srv/main.c)
+  target_link_libraries(ftl_srv ${MSQUIC_LIBRARIES})
 endif()
 
 # Install rules

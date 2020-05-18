@@ -3,4 +3,5 @@
 *.orig
 .vs/*
 publish
+build
 build-output

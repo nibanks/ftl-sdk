@@ -93,46 +93,6 @@ int recv_all(SOCKET sock, char * buf, int buflen, const char line_terminator) {
     return bytes_recd;
 }
 
-int ftl_get_hmac(SOCKET sock, char * auth_key, char * dst) {
-    char buf[2048];
-    int string_len;
-    int response_code;
-
-    send(sock, "HMAC\r\n\r\n", 8, 0);
-    string_len = recv_all(sock, buf, 2048, '\n');
-    if (string_len < 4 || string_len == 2048) {
-        return 0;
-    }
-
-    response_code = ftl_read_response_code(buf);
-    if (response_code != FTL_INGEST_RESP_OK) {
-        return 0;
-    }
-
-    int len = string_len - 5; // Strip "200 " and "\n"
-    if (len % 2) {
-        return 0;
-    }
-
-    int messageLen = len / 2;
-    unsigned char *msg;
-
-    if( (msg = (unsigned char*)malloc(messageLen * sizeof(*msg))) == NULL){
-        return 0;
-    }
-
-    int i;
-    const char *hexMsgBuf = buf + 4;
-    for(i = 0; i < messageLen; i++) {
-        msg[i] = (decode_hex_char(hexMsgBuf[i * 2]) << 4) +
-                  decode_hex_char(hexMsgBuf[(i * 2) + 1]);
-    }
-
-    hmacsha512(auth_key, msg, messageLen, dst);
-    free(msg);
-    return 1;
-}
-
 const char * ftl_audio_codec_to_string(ftl_audio_codec_t codec) {
   switch (codec) {
     case FTL_AUDIO_NULL: return "";
@@ -179,7 +139,7 @@ BOOL ftl_get_state(ftl_stream_configuration_private_t *ftl, ftl_state_t state) {
 }
 
 BOOL is_legacy_ingest(ftl_stream_configuration_private_t *ftl) {
-  return ftl->media.assigned_port == FTL_UDP_MEDIA_PORT;
+  return 0; // ftl->media.assigned_port == FTL_UDP_MEDIA_PORT;
 }
 
 ftl_status_t enqueue_status_msg(ftl_stream_configuration_private_t *ftl, ftl_status_msg_t *stats_msg) {
