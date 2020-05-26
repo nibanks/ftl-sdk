@@ -56,6 +56,7 @@ endif()
 # We use MsQuic for QUIC protocol functionality.
 SET(QUIC_BUILD_TOOLS OFF CACHE BOOL "Disable MsQuic Tools Build")
 SET(QUIC_BUILD_TEST OFF CACHE BOOL "Disable MsQuic Tests Build")
+SET(QUIC_OUTPUT_DIR ${CMAKE_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release> CACHE STRING "Output directory for build artifacts")
 add_subdirectory(msquic)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/msquic/src/inc)
 SET(MSQUIC_LIBRARIES msquic)
