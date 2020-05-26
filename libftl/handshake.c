@@ -25,261 +25,171 @@
 #define __FTL_INTERNAL
 #include "ftl.h"
 #include "ftl_private.h"
+#include "hmac/hmac.h"
 #include <stdarg.h>
 
-OS_THREAD_ROUTINE  connection_status_thread(void *data);
-OS_THREAD_ROUTINE  control_keepalive_thread(void *data);
-static ftl_response_code_t _ftl_get_response(ftl_stream_configuration_private_t *ftl, char *response_buf, int response_len);
+QUIC_CONNECTION_CALLBACK quic_connection_callback;
+QUIC_STREAM_CALLBACK quic_auth_stream_callback;
+QUIC_STREAM_CALLBACK quic_config_stream_callback;
 
-static ftl_response_code_t _ftl_send_command(ftl_stream_configuration_private_t *ftl_cfg, BOOL need_response, char *response_buf, int response_len, const char *cmd_fmt, ...);
-ftl_status_t _log_response(ftl_stream_configuration_private_t *ftl, int response_code);
+static ftl_response_code_t _ftl_send_command(ftl_stream_configuration_private_t* ftl, HQUIC stream, const char* cmd_fmt, ...);
 
-ftl_status_t _init_control_connection(ftl_stream_configuration_private_t *ftl) {
-  int err = 0;
-  SOCKET sock = 0;
-  struct addrinfo hints;
-  memset(&hints, 0, sizeof(hints));
+ftl_status_t _ingest_connect(ftl_stream_configuration_private_t* ftl) {
   ftl_status_t retval = FTL_SUCCESS;
-
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_protocol = 0;
-
-  char ingest_ip[IPVX_ADDR_ASCII_LEN];
-
-  struct addrinfo* resolved_names = 0;
-  struct addrinfo* p = 0;
-
-  int ingest_port = INGEST_PORT;
-  char ingest_port_str[10];
 
   if (ftl_get_state(ftl, FTL_CONNECTED)) {
     return FTL_ALREADY_CONNECTED;
   }
-
-  snprintf(ingest_port_str, 10, "%d", ingest_port);
 
   if ((retval = _set_ingest_hostname(ftl)) != FTL_SUCCESS) {
     return retval;
   }
 
-  err = getaddrinfo(ftl->ingest_hostname, ingest_port_str, &hints, &resolved_names);
-  if (err != 0) {
-    FTL_LOG(ftl, FTL_LOG_ERROR, "getaddrinfo failed to look up ingest address %s.", ftl->ingest_hostname);
-    FTL_LOG(ftl, FTL_LOG_ERROR, "gai error was: %s", gai_strerror(err));
-    return FTL_DNS_FAILURE;
+  do {
+    QUIC_STATUS status;
+    QUIC_BUFFER alpn = { sizeof("flt")-1, (uint8_t*)"flt" };
+
+    status = msquic->SessionOpen(quic_registration, &alpn, 1, 0, &ftl->ingest_session);
+    if (QUIC_FAILED(status)) {
+      FTL_LOG(ftl, FTL_LOG_ERROR, "failed to open quic session.  error: 0x%x", status);
+      retval = FTL_MALLOC_FAILURE; // TODO - Map errors?
+      break;
+    }
+
+    status = msquic->ConnectionOpen(ftl->ingest_session, quic_connection_callback, ftl, &ftl->ingest_connection);
+    if (QUIC_FAILED(status)) {
+      FTL_LOG(ftl, FTL_LOG_ERROR, "failed to open quic connection.  error: 0x%x", status);
+      retval = FTL_CONNECT_ERROR; // TODO - Map errors?
+      break;
+    }
+
+    uint32_t cert_validation_flags = QUIC_CERTIFICATE_FLAG_DISABLE_CERT_VALIDATION;
+    status = msquic->SetParam(
+        ftl->ingest_connection,
+        QUIC_PARAM_LEVEL_CONNECTION,
+        QUIC_PARAM_CONN_CERT_VALIDATION_FLAGS,
+        sizeof(cert_validation_flags),
+        &cert_validation_flags);
+    if (QUIC_FAILED(status)) {
+        FTL_LOG(ftl, FTL_LOG_ERROR, "failed to set param CERT_VALIDATION_FLAGS.  error: 0x%x", status);
+        retval = FTL_CONNECT_ERROR; // TODO - Map errors?
+        break;
+    }
+
+    uint16_t peer_bidi_stream_count = 1;
+    status = msquic->SetParam(
+      ftl->ingest_connection,
+      QUIC_PARAM_LEVEL_CONNECTION,
+      QUIC_PARAM_CONN_PEER_BIDI_STREAM_COUNT,
+      sizeof(peer_bidi_stream_count),
+      &peer_bidi_stream_count);
+    if (QUIC_FAILED(status)) {
+      FTL_LOG(ftl, FTL_LOG_ERROR, "failed to set param PEER_BIDI_STREAM_COUNT.  error: 0x%x", status);
+      retval = FTL_CONNECT_ERROR; // TODO - Map errors?
+      break;
+    }
+
+    status = msquic->ConnectionStart(ftl->ingest_connection, AF_UNSPEC, ftl->ingest_hostname, INGEST_PORT);
+    if (QUIC_FAILED(status)) {
+      FTL_LOG(ftl, FTL_LOG_ERROR, "failed to start quic connection.  error: 0x%x", status);
+      retval = FTL_CONNECT_ERROR; // TODO - Map errors?
+      break;
+    }
+
+    return FTL_SUCCESS;
+
+  } while (0);
+
+  if (ftl->ingest_connection) {
+    msquic->ConnectionClose(ftl->ingest_connection);
+    ftl->ingest_connection = 0;
   }
 
-  /* Open a socket to the control port */
-  for (p = resolved_names; p != NULL; p = p->ai_next) {
-    sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-    if (sock == -1) {
-      /* try the next candidate */
-      FTL_LOG(ftl, FTL_LOG_DEBUG, "failed to create socket. error: %s", get_socket_error());
-      continue;
-    }
-    
-    if (p->ai_family == AF_INET) {
-      struct sockaddr_in *ipv4_addr = (struct sockaddr_in *)p->ai_addr;
-      inet_ntop(p->ai_family, &ipv4_addr->sin_addr, ingest_ip, sizeof(ingest_ip));
-    }
-    else if (p->ai_family == AF_INET6) {
-      struct sockaddr_in6 *ipv6_addr = (struct sockaddr_in6 *)p->ai_addr;
-      inet_ntop(p->ai_family, &ipv6_addr->sin6_addr, ingest_ip, sizeof(ingest_ip));
-    }
-    else {
-      continue;
-    }
-
-    FTL_LOG(ftl, FTL_LOG_DEBUG, "Got IP: %s\n", ingest_ip);
-    ftl->ingest_ip = _strdup(ingest_ip);
-    ftl->socket_family = p->ai_family;
-
-    /* Go for broke */
-    if (connect(sock, p->ai_addr, (int)p->ai_addrlen) == -1) {
-      FTL_LOG(ftl, FTL_LOG_DEBUG, "failed to connect on candidate, error: %s", get_socket_error());
-      close_socket(sock);
-      sock = 0;
-      continue;
-    }
-
-    /* If we got here, we successfully connected */
-    if (set_socket_enable_keepalive(sock) != 0) {
-      FTL_LOG(ftl, FTL_LOG_DEBUG, "failed to enable keep alives.  error: %s", get_socket_error());
-    }
-
-    if (set_socket_recv_timeout(sock, SOCKET_RECV_TIMEOUT_MS) != 0) {
-      FTL_LOG(ftl, FTL_LOG_DEBUG, "failed to set recv timeout.  error: %s", get_socket_error());
-    }
-
-    if (set_socket_send_timeout(sock, SOCKET_SEND_TIMEOUT_MS) != 0) {
-      FTL_LOG(ftl, FTL_LOG_DEBUG, "failed to set send timeout.  error: %s", get_socket_error());
-    }
-
-    break;
+  if (ftl->ingest_session) {
+    msquic->SessionClose(ftl->ingest_session);
+    ftl->ingest_session = 0;
   }
 
-  /* Free the resolved name struct */
-  freeaddrinfo(resolved_names);
-
-  /* Check to see if we actually connected */
-  if (sock <= 0) {
-    FTL_LOG(ftl, FTL_LOG_ERROR, "failed to connect to ingest. Last error was: %s",
-      get_socket_error());
-    return FTL_CONNECT_ERROR;
-  }
-
-  ftl->ingest_socket = sock;
-  
-  return FTL_SUCCESS;
+  return retval;
 }
 
-ftl_status_t _ingest_connect(ftl_stream_configuration_private_t *ftl) {
-  ftl_response_code_t response_code = FTL_INGEST_RESP_UNKNOWN;
-  char response[MAX_INGEST_COMMAND_LEN];
-
-  if (ftl_get_state(ftl, FTL_CONNECTED)) {
-    return FTL_ALREADY_CONNECTED;
-  }
-
-  if (ftl->ingest_socket <= 0) {
-    return FTL_SOCKET_NOT_CONNECTED;
-  }
+void _ingest_authenticate(ftl_stream_configuration_private_t *ftl) {
+    ftl_response_code_t response_code;
 
   do {
 
-    if (!ftl_get_hmac(ftl->ingest_socket, ftl->key, ftl->hmacBuffer)) {
-      FTL_LOG(ftl, FTL_LOG_ERROR, "could not get a signed HMAC!");
-      response_code = FTL_INGEST_NO_RESPONSE;
+    hmacsha512(ftl->key, ftl->challengeBuffer, ftl->challengeBufferLength, ftl->hmacBuffer);
+    if ((response_code = _ftl_send_command(ftl, ftl->ingest_auth_stream, "CONNECT %d $%s", ftl->channel_id, ftl->hmacBuffer)) != FTL_INGEST_RESP_OK) {
       break;
     }
 
-    if ((response_code = _ftl_send_command(ftl, TRUE, response, sizeof(response), "CONNECT %d $%s", ftl->channel_id, ftl->hmacBuffer)) != FTL_INGEST_RESP_OK) {
-      break;
+    /* Tell the server that's the end of our authentication */
+    if (QUIC_FAILED(msquic->StreamShutdown(ftl->ingest_auth_stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0))) {
+        break;
     }
 
-    /* We always send our version component first */
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "ProtocolVersion: %d.%d", FTL_VERSION_MAJOR, FTL_VERSION_MINOR)) != FTL_INGEST_RESP_OK) {
-      break;
+    /* Open a new stream to send configuration data */
+    if (QUIC_FAILED(msquic->StreamOpen(ftl->ingest_connection, 0, quic_config_stream_callback, ftl, &ftl->ingest_config_stream)) ||
+        QUIC_FAILED(msquic->StreamStart(ftl->ingest_config_stream, QUIC_STREAM_START_FLAG_NONE))) {
+        break;
     }
 
-    /* Cool. Now ingest wants our stream meta-data, which we send as key-value pairs, followed by a "." */
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "VendorName: %s", ftl->vendor_name)) != FTL_INGEST_RESP_OK) {
-      break;
-    }
+    // TODO - The following should be sent all at once. Ideally as a binary blob.
 
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "VendorVersion: %s", ftl->vendor_version)) != FTL_INGEST_RESP_OK) {
+    if ((response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "ProtocolVersion: %d.%d", FTL_VERSION_MAJOR, FTL_VERSION_MINOR)) != FTL_INGEST_RESP_OK ||
+        (response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "VendorName: %s", ftl->vendor_name)) != FTL_INGEST_RESP_OK ||
+        (response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "VendorVersion: %s", ftl->vendor_version)) != FTL_INGEST_RESP_OK) {
       break;
     }
 
     ftl_video_component_t *video = &ftl->video;
     /* We're sending video */
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "Video: true")) != FTL_INGEST_RESP_OK) {
-      break;
+    if ((response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "Video: true")) != FTL_INGEST_RESP_OK ||
+        (response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "VideoCodec: %s", ftl_video_codec_to_string(video->codec))) != FTL_INGEST_RESP_OK ||
+        (response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "VideoHeight: %d", video->height)) != FTL_INGEST_RESP_OK ||
+        (response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "VideoWidth: %d", video->width)) != FTL_INGEST_RESP_OK ||
+        (response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "VideoPayloadType: %d", video->media_component.payload_type)) != FTL_INGEST_RESP_OK ||
+        (response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "VideoIngestSSRC: %d", video->media_component.ssrc)) != FTL_INGEST_RESP_OK) {
+        break;
     }
 
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "VideoCodec: %s", ftl_video_codec_to_string(video->codec))) != FTL_INGEST_RESP_OK) {
-      break;
-    }
-
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "VideoHeight: %d", video->height)) != FTL_INGEST_RESP_OK) {
-      break;
-    }
-
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "VideoWidth: %d", video->width)) != FTL_INGEST_RESP_OK) {
-      break;
-    }
-
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "VideoPayloadType: %d", video->media_component.payload_type)) != FTL_INGEST_RESP_OK) {
-      break;
-    }
-
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "VideoIngestSSRC: %d", video->media_component.ssrc)) != FTL_INGEST_RESP_OK) {
-      break;
-    }
 
     ftl_audio_component_t *audio = &ftl->audio;
-
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "Audio: true")) != FTL_INGEST_RESP_OK) {
-      break;
-    }
-
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "AudioCodec: %s", ftl_audio_codec_to_string(audio->codec))) != FTL_INGEST_RESP_OK) {
-      break;
-    }
-
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "AudioPayloadType: %d", audio->media_component.payload_type)) != FTL_INGEST_RESP_OK) {
-      break;
-    }
-
-    if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "AudioIngestSSRC: %d", audio->media_component.ssrc)) != FTL_INGEST_RESP_OK) {
-      break;
-    }
-
-    if ((response_code = _ftl_send_command(ftl, TRUE, response, sizeof(response), ".")) != FTL_INGEST_RESP_OK) {
-      break;
-    }
-
-    /*see if there is a port specified otherwise use default*/
-    int port = ftl_read_media_port(response);
-
-    ftl->media.assigned_port = port;
-
-    ftl_set_state(ftl, FTL_CONNECTED);
-
-    if (os_semaphore_create(&ftl->connection_thread_shutdown, "/ConnectionThreadShutdown", O_CREAT, 0) < 0) {
-        response_code = FTL_MALLOC_FAILURE;
+    if ((response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "Audio: true")) != FTL_INGEST_RESP_OK ||
+        (response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "AudioCodec: %s", ftl_audio_codec_to_string(audio->codec))) != FTL_INGEST_RESP_OK ||
+        (response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "AudioPayloadType: %d", audio->media_component.payload_type)) != FTL_INGEST_RESP_OK ||
+        (response_code = _ftl_send_command(ftl, ftl->ingest_config_stream, "AudioIngestSSRC: %d", audio->media_component.ssrc)) != FTL_INGEST_RESP_OK) {
         break;
     }
 
-    if (os_semaphore_create(&ftl->keepalive_thread_shutdown, "/KeepAliveThreadShutdown", O_CREAT, 0) < 0) {
-        response_code = FTL_MALLOC_FAILURE;
+    /* Tell the server that's the end of our config */
+    if (QUIC_FAILED(msquic->StreamShutdown(ftl->ingest_config_stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0))) {
         break;
     }
 
-    ftl_set_state(ftl, FTL_CXN_STATUS_THRD);
-    if ((os_create_thread(&ftl->connection_thread, NULL, connection_status_thread, ftl)) != 0) {
-      ftl_clear_state(ftl, FTL_CXN_STATUS_THRD);
-      response_code = FTL_MALLOC_FAILURE;
-      break;
-    }
-
-    ftl_set_state(ftl, FTL_KEEPALIVE_THRD);
-    if ((os_create_thread(&ftl->keepalive_thread, NULL, control_keepalive_thread, ftl)) != 0) {
-      ftl_clear_state(ftl, FTL_KEEPALIVE_THRD);\
-      response_code = FTL_MALLOC_FAILURE;
-      break;
-    }
-
-    FTL_LOG(ftl, FTL_LOG_INFO, "Successfully connected to ingest.  Media will be sent to port %d\n", ftl->media.assigned_port);
-  
-    return FTL_SUCCESS;
+    return;
   } while (0);
 
   _ingest_disconnect(ftl);
+}
 
-  return _log_response(ftl, response_code);;
+void _ingest_handshake_complete(ftl_stream_configuration_private_t* ftl) {
+
+    ftl_set_state(ftl, FTL_CONNECTED);
+
+    FTL_LOG(ftl, FTL_LOG_INFO, "Successfully connected to ingest.\n");
+
+    media_init(ftl);
 }
 
 ftl_status_t _ingest_disconnect(ftl_stream_configuration_private_t *ftl) {
 
-    ftl_response_code_t response_code = FTL_INGEST_RESP_UNKNOWN;
-    char response[MAX_INGEST_COMMAND_LEN];
-
-    if (ftl_get_state(ftl, FTL_KEEPALIVE_THRD)) {
-        ftl_clear_state(ftl, FTL_KEEPALIVE_THRD);
-        os_semaphore_post(&ftl->keepalive_thread_shutdown);
-        os_wait_thread(ftl->keepalive_thread);
-        os_destroy_thread(ftl->keepalive_thread);
-        os_semaphore_delete(&ftl->keepalive_thread_shutdown);
-    }
-
-    if (ftl_get_state(ftl, FTL_CXN_STATUS_THRD)) {
-        ftl_clear_state(ftl, FTL_CXN_STATUS_THRD);
-        os_semaphore_post(&ftl->connection_thread_shutdown);
-        os_wait_thread(ftl->connection_thread);
-        os_destroy_thread(ftl->connection_thread);
-        os_semaphore_delete(&ftl->connection_thread_shutdown);
+    if (ftl->ingest_connection) {
+        if (ftl_get_state(ftl, FTL_CONNECTED)) {
+            ftl_clear_state(ftl, FTL_CONNECTED);
+            FTL_LOG(ftl, FTL_LOG_INFO, "light-saber disconnect\n");
+        }
+        msquic->ConnectionShutdown(ftl->ingest_connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0); // TODO - Send a better error code
     }
 
     if (ftl_get_state(ftl, FTL_BITRATE_THRD))
@@ -291,66 +201,41 @@ ftl_status_t _ingest_disconnect(ftl_stream_configuration_private_t *ftl) {
         os_semaphore_delete(&ftl->bitrate_thread_shutdown);
     }
 
-    if (ftl_get_state(ftl, FTL_CONNECTED)) {
-
-        ftl_clear_state(ftl, FTL_CONNECTED);
-
-        FTL_LOG(ftl, FTL_LOG_INFO, "light-saber disconnect\n");
-        if ((response_code = _ftl_send_command(ftl, FALSE, response, sizeof(response), "DISCONNECT", ftl->channel_id)) != FTL_INGEST_RESP_OK) {
-            FTL_LOG(ftl, FTL_LOG_ERROR, "Ingest Disconnect failed with %d (%s)\n", response_code, response);
-        }
+    if (ftl->ingest_config_stream) {
+        msquic->StreamClose(ftl->ingest_config_stream);
+        ftl->ingest_config_stream = 0;
     }
 
-    if (ftl->ingest_socket > 0) {
-        close_socket(ftl->ingest_socket);
-        ftl->ingest_socket = 0;
+    if (ftl->ingest_auth_stream) {
+        msquic->StreamClose(ftl->ingest_auth_stream);
+        ftl->ingest_auth_stream = 0;
+    }
+
+    if (ftl->ingest_connection) {
+        // TODO - Wait for shutdown complete
+        msquic->ConnectionClose(ftl->ingest_connection);
+        ftl->ingest_connection = 0;
+    }
+
+    if (ftl->ingest_session) {
+        msquic->SessionClose(ftl->ingest_session);
+        ftl->ingest_session = 0;
     }
 
     return FTL_SUCCESS;
 }
 
-static ftl_response_code_t _ftl_get_response(ftl_stream_configuration_private_t *ftl, char *response_buf, int response_len){
-  int len;
-  memset(response_buf, 0, response_len);
-  len = recv_all(ftl->ingest_socket, response_buf, response_len, '\n');
-
-  if (len <= 0) {
-
-#ifdef _WIN32
-    int error = WSAGetLastError();
-    if (error == WSAETIMEDOUT)
-    {
-      return FTL_INGEST_RESP_INTERNAL_SOCKET_TIMEOUT;
-    }
-    else
-    {
-      return FTL_INGEST_RESP_INTERNAL_SOCKET_CLOSED;
-    }
-#else
-    if (len == 0)
-    {
-      return FTL_INGEST_RESP_INTERNAL_SOCKET_CLOSED;
-    }
-    else
-    {
-      return FTL_INGEST_RESP_INTERNAL_SOCKET_TIMEOUT;
-    }
-#endif
-  }
-
-  return ftl_read_response_code(response_buf);
-}
-
-static ftl_response_code_t _ftl_send_command(ftl_stream_configuration_private_t *ftl, BOOL need_response, char *response_buf, int response_len, const char *cmd_fmt, ...) {
+static ftl_response_code_t _ftl_send_command(ftl_stream_configuration_private_t* ftl, HQUIC stream, const char* cmd_fmt, ...) {
   int resp_code = FTL_INGEST_RESP_OK;
   va_list valist;
   char *buf = NULL;
   int len;
   int buflen = MAX_INGEST_COMMAND_LEN * sizeof(char);
   char *format = NULL;
+  QUIC_BUFFER* quic_buf;
 
   do {
-    if ((buf = (char*)malloc(buflen)) == NULL) {
+    if ((quic_buf = (QUIC_BUFFER*)malloc(sizeof(QUIC_BUFFER) + buflen)) == NULL) {
       resp_code = FTL_INGEST_RESP_INTERNAL_MEMORY_ERROR;
       break;
     }
@@ -359,6 +244,8 @@ static ftl_response_code_t _ftl_send_command(ftl_stream_configuration_private_t 
       resp_code = FTL_INGEST_RESP_INTERNAL_MEMORY_ERROR;
       break;
     }
+
+    buf = (char*)(quic_buf + 1);
 
     sprintf_s(format, strlen(cmd_fmt) + 5, "%s\r\n\r\n", cmd_fmt);
 
@@ -375,165 +262,23 @@ static ftl_response_code_t _ftl_send_command(ftl_stream_configuration_private_t 
       break;
     }
 
-    send(ftl->ingest_socket, buf, len, 0);
+    quic_buf->Buffer = buf;
+    quic_buf->Length = (uint32_t)len;
 
-    if (need_response) {
-      resp_code = _ftl_get_response(ftl, response_buf, response_len);
+    if (QUIC_SUCCEEDED(msquic->StreamSend(stream, quic_buf, 1, 0, quic_buf))) {
+      quic_buf = NULL;
     }
   } while (0);
 
-  if(buf != NULL){
-    free(buf);
+  if (quic_buf != NULL){
+    free(quic_buf);
   }
 
-  if(format != NULL){
-      free(format);
+  if (format != NULL){
+    free(format);
   }
 
   return resp_code;
-}
-
-OS_THREAD_ROUTINE control_keepalive_thread(void *data)
-{
-  ftl_stream_configuration_private_t *ftl = (ftl_stream_configuration_private_t *)data;
-  ftl_response_code_t response_code;
-  struct timeval last_send_time, now;
-  int64_t ms_since_send = 0;
-
-  gettimeofday(&last_send_time, NULL);
-
-  while (ftl_get_state(ftl, FTL_KEEPALIVE_THRD)) {
-    os_semaphore_pend(&ftl->keepalive_thread_shutdown, KEEPALIVE_FREQUENCY_MS);
-
-    if (!ftl_get_state(ftl, FTL_KEEPALIVE_THRD))
-    {
-      break;
-    }
-
-    // Check how long it has been since we sent a ping last.
-    gettimeofday(&now, NULL);
-    ms_since_send = timeval_subtract_to_ms(&now, &last_send_time);
-    if (ms_since_send > KEEPALIVE_FREQUENCY_MS + KEEPALIVE_SEND_WARN_TOLERANCE_MS)
-    {
-       FTL_LOG(ftl, FTL_LOG_INFO, "Warning, ping time tolerance warning. Time since last ping %d ms", ms_since_send);
-    }
-    gettimeofday(&last_send_time, NULL);
-
-    // Send the ping to ingest now.
-    if ((response_code = _ftl_send_command(ftl, FALSE, NULL, 0, "PING %d", ftl->channel_id)) != FTL_INGEST_RESP_OK) {
-      FTL_LOG(ftl, FTL_LOG_ERROR, "Ingest ping failed with %d\n", response_code);
-    }
-  }
-
-  FTL_LOG(ftl, FTL_LOG_INFO, "Exited control_keepalive_thread\n");
-
-  return 0;
-}
-
-OS_THREAD_ROUTINE connection_status_thread(void *data)
-{
-    ftl_stream_configuration_private_t *ftl = (ftl_stream_configuration_private_t *)data;
-    char buf[1024];
-    ftl_status_msg_t status;
-    struct timeval last_ping, now;
-    int64_t ms_since_ping = 0;
-
-    // We ping every 5 seconds, but don't timeout the connection until 30 seconds has passed
-    // without hearing anything back from the ingest. This time is high, but some some poor networks
-    // this can happen.
-    int keepalive_is_late = 6 * KEEPALIVE_FREQUENCY_MS; 
-
-    gettimeofday(&last_ping, NULL);
-
-    // Loop while the connection status thread should be alive.
-    while (ftl_get_state(ftl, FTL_CXN_STATUS_THRD)) {
-
-        // Wait on the shutdown event for at most STATUS_THREAD_SLEEP_TIME_MS
-        os_semaphore_pend(&ftl->connection_thread_shutdown, STATUS_THREAD_SLEEP_TIME_MS);
-        if (!ftl_get_state(ftl, FTL_CXN_STATUS_THRD))
-        {
-            break;
-        }
-
-        ftl_status_t error_code = FTL_SUCCESS;
-
-        // Check if there is any data for us to consume.
-        unsigned long bytesAvailable = 0;
-        int ret = get_socket_bytes_available(ftl->ingest_socket, &bytesAvailable);
-        if (ret < 0)
-        {
-            FTL_LOG(ftl, FTL_LOG_ERROR, "Failed to call get_socket_bytes_available, %s", get_socket_error());
-            error_code = FTL_UNKNOWN_ERROR_CODE;
-        }
-        else
-        {
-            // If we have data waiting, consume it now.
-            if (bytesAvailable > 0)
-            {
-                int resp_code = _ftl_get_response(ftl, buf, sizeof(buf));
-
-                // If we got a ping response, mark the time and loop again.
-                if (resp_code  == FTL_INGEST_RESP_PING) {
-                    gettimeofday(&last_ping, NULL);
-                    continue;
-                }
-
-                // If it's anything else, it's an error.
-                error_code = _log_response(ftl, resp_code);
-            }
-        }
-
-        // If we don't have an error, check if the ping has timed out.
-        if (error_code == FTL_SUCCESS)
-        {
-            // Get the current time and figure out the time since the last ping was recieved.
-            gettimeofday(&now, NULL);
-            ms_since_ping = timeval_subtract_to_ms(&now, &last_ping);
-            if (ms_since_ping < keepalive_is_late) {
-                continue;
-            }
-
-            // Otherwise, we havn't gotten the ping in too long.
-            FTL_LOG(ftl, FTL_LOG_ERROR, "Ingest ping timeout, we haven't gotten a ping in %d ms.", ms_since_ping);
-            error_code = FTL_NO_PING_RESPONSE;
-        }
-
-        // At this point something is wrong, and we are going to shutdown the connection. Do one more check that we
-        // should still be running.
-        if (!ftl_get_state(ftl, FTL_CXN_STATUS_THRD))
-        {
-            break;
-        }
-        FTL_LOG(ftl, FTL_LOG_ERROR, "Ingest connection has dropped: error code %d\n", error_code);
-
-        // Clear the state that this thread is running. If we don't do this we will dead lock
-        // in the internal_ingest_disconnect.
-        ftl_clear_state(ftl, FTL_CXN_STATUS_THRD);
-
-        // Shutdown the ingest connection.
-        if (os_trylock_mutex(&ftl->disconnect_mutex)) {
-            internal_ingest_disconnect(ftl);
-            os_unlock_mutex(&ftl->disconnect_mutex);
-        }
-
-        // Fire an event indicating we shutdown.
-        status.type = FTL_STATUS_EVENT;
-        if (error_code == FTL_NO_MEDIA_TIMEOUT) {
-            status.msg.event.reason = FTL_STATUS_EVENT_REASON_NO_MEDIA;
-        }
-        else {
-            status.msg.event.reason = FTL_STATUS_EVENT_REASON_UNKNOWN;
-        }
-        status.msg.event.type = FTL_STATUS_EVENT_TYPE_DISCONNECTED;
-        status.msg.event.error_code = error_code;
-        enqueue_status_msg(ftl, &status);
-
-        // Exit the loop.
-        break;		
-    }
-
-    FTL_LOG(ftl, FTL_LOG_INFO, "Exited connection_status_thread");
-    return 0;
 }
 
 ftl_status_t _log_response(ftl_stream_configuration_private_t *ftl, int response_code){
@@ -598,7 +343,105 @@ ftl_status_t _log_response(ftl_stream_configuration_private_t *ftl, int response
     case FTL_INGEST_RESP_UNKNOWN:
         FTL_LOG(ftl, FTL_LOG_ERROR, "Ingest unknown response.");
         return FTL_INTERNAL_ERROR;
-  }    
+  }
 
   return FTL_UNKNOWN_ERROR_CODE;
+}
+
+QUIC_STATUS
+QUIC_API
+quic_connection_callback(
+    _In_ HQUIC connection,
+    _In_opt_ void* context,
+    _Inout_ QUIC_CONNECTION_EVENT* event
+    )
+{
+    ftl_stream_configuration_private_t *ftl = (ftl_stream_configuration_private_t *)context;
+    switch (event->Type) {
+    case QUIC_CONNECTION_EVENT_CONNECTED:
+      printf("QUIC_CONNECTION_EVENT_CONNECTED\n");
+      break;
+    case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
+      printf("QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT\n");
+      break;
+    case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER:
+      printf("QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_PEER\n");
+      _log_response(ftl, (int)event->SHUTDOWN_INITIATED_BY_PEER.ErrorCode);
+      break;
+    case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
+      printf("QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE\n");
+      break;
+    case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
+      if (event->PEER_STREAM_STARTED.Flags & QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL)
+        return QUIC_STATUS_NOT_SUPPORTED;
+      if (ftl->ingest_auth_stream == 0) {
+        ftl->challengeBufferLength = 0;
+        ftl->ingest_auth_stream = event->PEER_STREAM_STARTED.Stream;
+        msquic->SetCallbackHandler(event->PEER_STREAM_STARTED.Stream, quic_auth_stream_callback, ftl);
+      } else {
+        return QUIC_STATUS_NOT_SUPPORTED;
+      }
+      break;
+    case QUIC_CONNECTION_EVENT_DATAGRAM_SEND_STATE_CHANGED:
+      media_datagram_send_state_changed(
+        ftl,
+        event->DATAGRAM_SEND_STATE_CHANGED.State,
+        &event->DATAGRAM_SEND_STATE_CHANGED.ClientContext);
+      break;
+    }
+    return QUIC_STATUS_SUCCESS;
+}
+
+QUIC_STATUS
+QUIC_API
+quic_auth_stream_callback(
+    _In_ HQUIC stream,
+    _In_opt_ void* context,
+    _Inout_ QUIC_STREAM_EVENT* event
+    )
+{
+    ftl_stream_configuration_private_t *ftl = (ftl_stream_configuration_private_t *)context;
+    switch (event->Type) {
+    case QUIC_STREAM_EVENT_RECEIVE:
+      for (uint32_t i = 0; i < event->RECEIVE.BufferCount; ++i) {
+        if (event->RECEIVE.Buffers[i].Length + ftl->challengeBufferLength > sizeof(ftl->challengeBuffer)) {
+          msquic->ConnectionShutdown(ftl->ingest_connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 1); // TODO - Set an error code.
+          break;
+        }
+        memcpy(
+          ftl->challengeBuffer + ftl->challengeBufferLength,
+          event->RECEIVE.Buffers[i].Buffer,
+          event->RECEIVE.Buffers[i].Length);
+      }
+      break;
+    case QUIC_STREAM_EVENT_SEND_COMPLETE:
+      free(event->SEND_COMPLETE.ClientContext); // Our buffer we allocated for sending.
+      break;
+    case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
+      // We now have all the challenge buffer. Send the response.
+      _ingest_authenticate(ftl);
+      break;
+    }
+    return QUIC_STATUS_SUCCESS;
+}
+
+QUIC_STATUS
+QUIC_API
+quic_config_stream_callback(
+    _In_ HQUIC stream,
+    _In_opt_ void* context,
+    _Inout_ QUIC_STREAM_EVENT* event
+    )
+{
+    ftl_stream_configuration_private_t *ftl = (ftl_stream_configuration_private_t *)context;
+    switch (event->Type) {
+    case QUIC_STREAM_EVENT_SEND_COMPLETE:
+      free(event->SEND_COMPLETE.ClientContext); // Our buffer we allocated for sending.
+      break;
+    case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
+      // Yay. Server accepted our config.
+      _ingest_handshake_complete(ftl);
+      break;
+    }
+    return QUIC_STATUS_SUCCESS;
 }

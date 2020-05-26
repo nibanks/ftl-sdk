@@ -14,6 +14,9 @@ FTL_API const int FTL_VERSION_MAJOR = 0;
 FTL_API const int FTL_VERSION_MINOR = 9;
 FTL_API const int FTL_VERSION_MAINTENANCE = 14;
 
+const QUIC_API_TABLE* msquic;
+HQUIC quic_registration;
+
 // Initializes all sublibraries used by FTL
 FTL_API ftl_status_t ftl_init() {
   struct timeval now;
@@ -23,6 +26,12 @@ FTL_API ftl_status_t ftl_init() {
 #ifndef DISABLE_AUTO_INGEST
   curl_global_init(CURL_GLOBAL_ALL);
 #endif
+
+  const QUIC_REGISTRATION_CONFIG reg_config = { "flt-sdk", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
+  if (QUIC_FAILED(MsQuicOpen(&msquic)) ||
+      QUIC_FAILED(msquic->RegistrationOpen(&reg_config, &quic_registration))) {
+    return FTL_MALLOC_FAILURE;
+  }
 
   gettimeofday(&now, NULL);
   srand((unsigned int)now.tv_sec);
@@ -35,7 +44,7 @@ FTL_API ftl_status_t ftl_ingest_create(ftl_handle_t *ftl_handle, ftl_ingest_para
 
   do {
     if ((ftl = (ftl_stream_configuration_private_t *)malloc(sizeof(ftl_stream_configuration_private_t))) == NULL) {
-      // Note it is important that we return here otherwise the call to 
+      // Note it is important that we return here otherwise the call to
       // internal_ftl_ingest_destroy will fail!
       return FTL_MALLOC_FAILURE;
     }
@@ -100,7 +109,7 @@ FTL_API ftl_status_t ftl_ingest_create(ftl_handle_t *ftl_handle, ftl_ingest_para
 
   internal_ftl_ingest_destroy(ftl);
 
-  return ret_status;  
+  return ret_status;
 }
 
 FTL_API ftl_status_t ftl_ingest_connect(ftl_handle_t *ftl_handle){
@@ -108,17 +117,11 @@ FTL_API ftl_status_t ftl_ingest_connect(ftl_handle_t *ftl_handle){
   ftl_status_t status = FTL_SUCCESS;
 
   do {
-    if ((status = _init_control_connection(ftl)) != FTL_SUCCESS) {
-      break;
-    }
-
     if ((status = _ingest_connect(ftl)) != FTL_SUCCESS) {
       break;
     }
 
-    if ((status = media_init(ftl)) != FTL_SUCCESS) {
-      break;
-    }
+    // TODO - Wait for completion state
 
     return status;
   } while (0);
@@ -127,7 +130,7 @@ FTL_API ftl_status_t ftl_ingest_connect(ftl_handle_t *ftl_handle){
     internal_ingest_disconnect(ftl);
     os_unlock_mutex(&ftl->disconnect_mutex);
   }
-  
+
   return status;
 }
 
@@ -255,7 +258,7 @@ FTL_API ftl_status_t ftl_ingest_disconnect(ftl_handle_t *ftl_handle) {
 ftl_status_t internal_ingest_disconnect(ftl_stream_configuration_private_t *ftl) {
 
   ftl_status_t status_code;
-    
+
   ftl_set_state(ftl, FTL_DISCONNECT_IN_PROGRESS);
 
   if ((status_code = media_destroy(ftl)) != FTL_SUCCESS) {
@@ -268,7 +271,7 @@ ftl_status_t internal_ingest_disconnect(ftl_stream_configuration_private_t *ftl)
 
   ftl_clear_state(ftl, FTL_DISCONNECT_IN_PROGRESS);
 
-    
+
   return FTL_SUCCESS;
 }
 
@@ -288,7 +291,7 @@ ftl_status_t internal_ftl_ingest_destroy(ftl_stream_configuration_private_t *ftl
     }
 
     //wait a few ms for the thread to pull that last message and exit
-    
+
     int  wait_retries = 5;
     while (ftl->status_q.thread_waiting && wait_retries-- > 0) {
       sleep_ms(20);
@@ -413,7 +416,7 @@ FTL_API char* ftl_status_code_to_string(ftl_status_t status) {
   case FTL_UNKNOWN_ERROR_CODE:
   default:
     /* Unknown FTL error */
-    return "Unknown status code"; 
+    return "Unknown status code";
   }
 }
 
